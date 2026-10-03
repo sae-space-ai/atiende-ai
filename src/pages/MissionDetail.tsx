@@ -185,7 +185,7 @@ export default function MissionDetail() {
         size: file.size,
         hash,
         uploadedAt: new Date().toISOString(),
-        owner: 'local-user',
+        owner: 'anonymous',
         extractedText,
         status: 'processed',
       };

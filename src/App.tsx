@@ -4,29 +4,19 @@ import Dashboard from './pages/Dashboard';
 import NewMission from './pages/NewMission';
 import MissionDetail from './pages/MissionDetail';
 import Settings from './pages/Settings';
-import Login from './pages/Login';
 import Layout from './components/Layout';
-import { getCurrentUser, isAuthenticated, type AuthUser } from './store';
+import { getOrCreateSpaceId } from './space';
 
 function App() {
-  const [user, setUser] = useState<AuthUser | null>(null);
+  const [spaceId, setSpaceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const authed = isAuthenticated();
-    if (authed) {
-      setUser(getCurrentUser());
-    }
+    // Crear o recuperar el espacio anónimo
+    const id = getOrCreateSpaceId();
+    setSpaceId(id);
     setLoading(false);
   }, []);
-
-  const handleLogin = (loggedInUser: AuthUser) => {
-    setUser(loggedInUser);
-  };
-
-  const handleLogout = () => {
-    setUser(null);
-  };
 
   if (loading) {
     return (
@@ -41,14 +31,10 @@ function App() {
     );
   }
 
-  if (!user) {
-    return <Login onLogin={handleLogin} />;
-  }
-
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={<Layout userName={user.name} onLogout={handleLogout} />}>
+        <Route path="/" element={<Layout spaceId={spaceId} />}>
           <Route index element={<Dashboard />} />
           <Route path="nueva" element={<NewMission />} />
           <Route path="mision/:id" element={<MissionDetail />} />

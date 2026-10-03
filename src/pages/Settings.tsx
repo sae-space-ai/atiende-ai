@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { CheckCircle2, XCircle, AlertTriangle, Shield, Database, Globe, Cpu, Save } from 'lucide-react';
+import { CheckCircle2, XCircle, AlertTriangle, Shield, Database, Globe, Cpu, Save, Info } from 'lucide-react';
 import { getSettings, saveSettings } from '../store';
+import { getSpaceLimits, getSpaceInfoMessage } from '../space';
 import type { AppSettings } from '../types';
 
 export default function Settings() {
@@ -13,6 +14,8 @@ export default function Settings() {
     setTimeout(() => setSaved(false), 2000);
   };
 
+  const limits = getSpaceLimits();
+
   const services = [
     {
       name: 'Proveedor de IA',
@@ -20,7 +23,6 @@ export default function Settings() {
       icon: Cpu,
       configured: settings.aiConfigured,
       detail: settings.aiConfigured ? `Proveedor: ${settings.aiProvider}` : 'No configurado. El agente no puede ejecutar tareas automáticas.',
-      action: 'Configurar',
     },
     {
       name: 'Almacenamiento de documentos',
@@ -28,7 +30,6 @@ export default function Settings() {
       icon: Database,
       configured: settings.storageConfigured,
       detail: settings.storageConfigured ? 'Configurado' : 'No configurado. Los documentos se almacenan localmente en el navegador.',
-      action: 'Configurar',
     },
     {
       name: 'Fuentes externas',
@@ -36,7 +37,6 @@ export default function Settings() {
       icon: Globe,
       configured: settings.externalSourcesConfigured,
       detail: settings.externalSourcesConfigured ? 'Configurado' : 'No configurado. El agente solo puede usar información aportada por el usuario.',
-      action: 'Configurar',
     },
     {
       name: 'Reconocimiento óptico (OCR)',
@@ -44,7 +44,6 @@ export default function Settings() {
       icon: Shield,
       configured: settings.ocrConfigured,
       detail: settings.ocrConfigured ? 'Configurado' : 'No configurado. Los PDFs escaneados no podrán procesarse automáticamente.',
-      action: 'Configurar',
     },
   ];
 
@@ -52,7 +51,21 @@ export default function Settings() {
     <div className="max-w-3xl mx-auto">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900">Configuración</h1>
-        <p className="text-gray-600 mt-1">Verifica qué servicios están disponibles y configura las integraciones.</p>
+        <p className="text-gray-600 mt-1">Verifica qué servicios están disponibles y consulta los límites de uso.</p>
+      </div>
+
+      {/* Anonymous space info */}
+      <div className="bg-blue-50 border border-blue-200 rounded-xl p-5 mb-8">
+        <div className="flex items-start gap-3">
+          <Info className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <h3 className="font-semibold text-blue-900 mb-1">Espacio anónimo</h3>
+            <p className="text-sm text-blue-800 mb-2">{getSpaceInfoMessage()}</p>
+            <p className="text-xs text-blue-700">
+              Tus datos están aislados mediante un identificador único. Otros visitantes no pueden acceder a tus misiones, documentos ni resultados.
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Services status */}
@@ -87,6 +100,37 @@ export default function Settings() {
         ))}
       </div>
 
+      {/* Usage limits */}
+      <div className="bg-white rounded-xl border border-gray-200 p-5 mb-8">
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">Límites de uso</h2>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxMissions}</p>
+            <p className="text-xs text-gray-600">Misiones máximas</p>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxDocumentsPerMission}</p>
+            <p className="text-xs text-gray-600">Documentos por misión</p>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxDocumentSizeMB} MB</p>
+            <p className="text-xs text-gray-600">Tamaño máximo por archivo</p>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxExecutionsPerHour}</p>
+            <p className="text-xs text-gray-600">Ejecuciones por hora</p>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxAICallsPerDay}</p>
+            <p className="text-xs text-gray-600">Llamadas a IA por día</p>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-3">
+            <p className="text-2xl font-bold text-gray-900">{limits.maxStorageMB} MB</p>
+            <p className="text-xs text-gray-600">Almacenamiento total</p>
+          </div>
+        </div>
+      </div>
+
       {/* General settings */}
       <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-4 mb-8">
         <h2 className="text-lg font-semibold text-gray-900">Preferencias generales</h2>
@@ -100,20 +144,6 @@ export default function Settings() {
             className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
           />
           <p className="text-xs text-gray-500 mt-1">Detectada automáticamente: {Intl.DateTimeFormat().resolvedOptions().timeZone}</p>
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Tamaño máximo de documento</label>
-          <select
-            value={settings.maxDocumentSize}
-            onChange={e => setSettings({ ...settings, maxDocumentSize: Number(e.target.value) })}
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-          >
-            <option value={5242880}>5 MB</option>
-            <option value={10485760}>10 MB</option>
-            <option value={20971520}>20 MB</option>
-            <option value={52428800}>50 MB</option>
-          </select>
         </div>
 
         <div>
@@ -140,7 +170,7 @@ export default function Settings() {
         <div className="space-y-3 text-sm text-gray-700">
           <div className="flex items-start gap-2">
             <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
-            <p>Los datos se almacenan localmente en tu navegador. No se envían a servidores externos.</p>
+            <p>Cada visitante tiene un espacio anónimo aislado. Tus datos no son accesibles por otros usuarios.</p>
           </div>
           <div className="flex items-start gap-2">
             <CheckCircle2 className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
@@ -152,11 +182,11 @@ export default function Settings() {
           </div>
           <div className="flex items-start gap-2">
             <AlertTriangle className="w-4 h-4 text-yellow-500 mt-0.5 flex-shrink-0" />
-            <p>La autenticación externa (Supabase, etc.) requiere configuración de servidor. Actualmente se usa sesión local.</p>
+            <p>Si eliminas las cookies del navegador, perderás acceso a tus misiones. No hay recuperación posible.</p>
           </div>
           <div className="flex items-start gap-2">
             <AlertTriangle className="w-4 h-4 text-yellow-500 mt-0.5 flex-shrink-0" />
-            <p>El seguimiento automático requiere un servicio de cola programada (no disponible en este entorno).</p>
+            <p>No hay sincronización entre dispositivos. Cada navegador mantiene su propio espacio aislado.</p>
           </div>
         </div>
       </div>
@@ -173,19 +203,19 @@ export default function Settings() {
           </li>
           <li className="flex items-start gap-2">
             <span className="font-mono text-xs bg-amber-100 px-1.5 py-0.5 rounded">2</span>
-            Configurar base de datos PostgreSQL (Supabase o similar)
+            Configurar base de datos PostgreSQL (Supabase) con políticas RLS por espacio anónimo
           </li>
           <li className="flex items-start gap-2">
             <span className="font-mono text-xs bg-amber-100 px-1.5 py-0.5 rounded">3</span>
-            Configurar almacenamiento de archivos (Supabase Storage, S3)
+            Configurar almacenamiento de archivos con aislamiento por espacio
           </li>
           <li className="flex items-start gap-2">
             <span className="font-mono text-xs bg-amber-100 px-1.5 py-0.5 rounded">4</span>
-            Configurar autenticación (Supabase Auth, Auth0)
+            Implementar verificación de espacio en servidor (no solo en cliente)
           </li>
           <li className="flex items-start gap-2">
             <span className="font-mono text-xs bg-amber-100 px-1.5 py-0.5 rounded">5</span>
-            Configurar cola de trabajos para ejecución persistente (Vercel Cron, Inngest)
+            Configurar cola de trabajos para ejecución persistente
           </li>
           <li className="flex items-start gap-2">
             <span className="font-mono text-xs bg-amber-100 px-1.5 py-0.5 rounded">6</span>

@@ -1,23 +1,16 @@
 import { Outlet, Link, useLocation } from 'react-router-dom';
 import { LayoutDashboard, PlusCircle, Settings, Bell } from 'lucide-react';
 import { getNotifications } from '../store';
-
-import { signOut } from '../store';
+import { getSpaceInfoMessage } from '../space';
 
 interface LayoutProps {
-  userName: string;
-  onLogout?: () => void;
+  spaceId: string | null;
 }
 
-export default function Layout({ userName, onLogout }: LayoutProps) {
+export default function Layout({ spaceId }: LayoutProps) {
   const location = useLocation();
   const notifications = getNotifications();
   const unreadCount = notifications.filter(n => !n.read).length;
-
-  const handleLogout = () => {
-    signOut();
-    if (onLogout) onLogout();
-  };
 
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
@@ -76,19 +69,6 @@ export default function Layout({ userName, onLogout }: LayoutProps) {
                   </span>
                 )}
               </button>
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 bg-indigo-100 rounded-full flex items-center justify-center">
-                  <span className="text-indigo-700 font-medium text-sm">{userName.charAt(0).toUpperCase()}</span>
-                </div>
-                <span className="text-sm text-gray-700 hidden sm:block">{userName}</span>
-                <button
-                  onClick={handleLogout}
-                  className="text-xs text-gray-400 hover:text-gray-600 ml-1 hidden sm:block"
-                  title="Cerrar sesión"
-                >
-                  Salir
-                </button>
-              </div>
             </div>
           </div>
         </div>
@@ -105,6 +85,15 @@ export default function Layout({ userName, onLogout }: LayoutProps) {
           </Link>
         </div>
       </header>
+
+      {/* Info banner about anonymous space */}
+      <div className="bg-blue-50 border-b border-blue-200">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2">
+          <p className="text-xs text-blue-700 text-center">
+            {getSpaceInfoMessage()}
+          </p>
+        </div>
+      </div>
 
       {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">

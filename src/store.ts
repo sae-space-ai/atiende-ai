@@ -1,13 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { Mission, MissionStatus, AppSettings, Notification, TaskStatus } from './types';
+import { getCurrentSpaceId } from './space';
 
-const STORAGE_KEYS = {
-  MISSIONS: 'atiende_missions',
-  SETTINGS: 'atiende_settings',
-  NOTIFICATIONS: 'atiende_notifications',
-  USER: 'atiende_user',
-  SESSION: 'atiende_session',
-};
+const STORAGE_PREFIX = 'atiende_';
 
 // Default settings
 const DEFAULT_SETTINGS: AppSettings = {
@@ -21,24 +16,37 @@ const DEFAULT_SETTINGS: AppSettings = {
   allowedExtensions: ['.pdf', '.docx', '.txt', '.csv', '.xlsx'],
 };
 
-// Generic storage helpers with error handling
-function getFromStorage<T>(key: string, fallback: T): T {
+// ============================================
+// STORAGE HELPERS (aislados por espacio anónimo)
+// ============================================
+
+function getStorageKey(baseKey: string): string {
+  const spaceId = getCurrentSpaceId();
+  if (!spaceId) {
+    throw new Error('No space ID available. Cannot access storage.');
+  }
+  return `${STORAGE_PREFIX}${spaceId}_${baseKey}`;
+}
+
+function getFromStorage<T>(baseKey: string, fallback: T): T {
   try {
+    const key = getStorageKey(baseKey);
     const data = localStorage.getItem(key);
     if (!data) return fallback;
     return JSON.parse(data) as T;
   } catch (error) {
-    console.error(`Error reading ${key} from storage:`, error);
+    console.error(`Error reading ${baseKey} from storage:`, error);
     return fallback;
   }
 }
 
-function saveToStorage<T>(key: string, data: T): boolean {
+function saveToStorage<T>(baseKey: string, data: T): boolean {
   try {
+    const key = getStorageKey(baseKey);
     localStorage.setItem(key, JSON.stringify(data));
     return true;
   } catch (error) {
-    console.error(`Error saving ${key} to storage:`, error);
+    console.error(`Error saving ${baseKey} to storage:`, error);
     if (error instanceof DOMException && error.name === 'QuotaExceededError') {
       addNotification({
         type: 'error',
@@ -51,57 +59,11 @@ function saveToStorage<T>(key: string, data: T): boolean {
 }
 
 // ============================================
-// AUTH (local simulation - real auth needs Supabase)
-// ============================================
-
-export interface AuthUser {
-  id: string;
-  name: string;
-  email: string;
-  isAuthenticated: boolean;
-}
-
-export function getCurrentUser(): AuthUser {
-  const user = getFromStorage<AuthUser>(STORAGE_KEYS.USER, {
-    id: 'local-user',
-    name: 'Usuario',
-    email: '',
-    isAuthenticated: true,
-  });
-  return user;
-}
-
-export function signIn(name: string, email: string): AuthUser {
-  const user: AuthUser = {
-    id: uuidv4(),
-    name: name || 'Usuario',
-    email: email || '',
-    isAuthenticated: true,
-  };
-  saveToStorage(STORAGE_KEYS.USER, user);
-  saveToStorage(STORAGE_KEYS.SESSION, {
-    token: uuidv4(),
-    userId: user.id,
-    createdAt: new Date().toISOString(),
-  });
-  return user;
-}
-
-export function signOut(): void {
-  localStorage.removeItem(STORAGE_KEYS.SESSION);
-}
-
-export function isAuthenticated(): boolean {
-  const user = getCurrentUser();
-  return user.isAuthenticated;
-}
-
-// ============================================
-// MISSIONS
+// MISSIONS (aisladas por espacio)
 // ============================================
 
 export function getMissions(): Mission[] {
-  return getFromStorage<Mission[]>(STORAGE_KEYS.MISSIONS, []);
+  return getFromStorage<Mission[]>('missions', []);
 }
 
 export function getMission(id: string): Mission | undefined {
@@ -117,12 +79,12 @@ export function saveMission(mission: Mission): boolean {
   } else {
     missions.push(mission);
   }
-  return saveToStorage(STORAGE_KEYS.MISSIONS, missions);
+  return saveToStorage('missions', missions);
 }
 
 export function deleteMission(id: string): boolean {
   const missions = getMissions().filter(m => m.id !== id);
-  return saveToStorage(STORAGE_KEYS.MISSIONS, missions);
+  return saveToStorage('missions', missions);
 }
 
 export function updateMissionStatus(id: string, status: MissionStatus): void {
@@ -153,23 +115,34 @@ export function updateTaskStatus(missionId: string, taskId: string, status: Task
 }
 
 // ============================================
-// SETTINGS
+// SETTINGS (compartidos, no sensibles)
 // ============================================
 
 export function getSettings(): AppSettings {
-  return getFromStorage<AppSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
+  // Settings son globales, no aislados por espacio
+  try {
+    const data = localStorage.getItem(`${STORAGE_PREFIX}settings`);
+    return data ? JSON.parse(data) : DEFAULT_SETTINGS;
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
 }
 
 export function saveSettings(settings: AppSettings): boolean {
-  return saveToStorage(STORAGE_KEYS.SETTINGS, settings);
+  try {
+    localStorage.setItem(`${STORAGE_PREFIX}settings`, JSON.stringify(settings));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ============================================
-// NOTIFICATIONS
+// NOTIFICATIONS (aisladas por espacio)
 // ============================================
 
 export function getNotifications(): Notification[] {
-  return getFromStorage<Notification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
+  return getFromStorage<Notification[]>('notifications', []);
 }
 
 export function addNotification(notification: Omit<Notification, 'id' | 'createdAt' | 'read'>): void {
@@ -180,7 +153,7 @@ export function addNotification(notification: Omit<Notification, 'id' | 'created
     createdAt: new Date().toISOString(),
     read: false,
   });
-  saveToStorage(STORAGE_KEYS.NOTIFICATIONS, notifications.slice(0, 100));
+  saveToStorage('notifications', notifications.slice(0, 100));
 }
 
 export function markNotificationRead(id: string): void {
@@ -188,12 +161,12 @@ export function markNotificationRead(id: string): void {
   const n = notifications.find(n => n.id === id);
   if (n) {
     n.read = true;
-    saveToStorage(STORAGE_KEYS.NOTIFICATIONS, notifications);
+    saveToStorage('notifications', notifications);
   }
 }
 
 export function clearNotifications(): void {
-  saveToStorage(STORAGE_KEYS.NOTIFICATIONS, []);
+  saveToStorage('notifications', []);
 }
 
 // ============================================
@@ -289,15 +262,13 @@ export function createMissionFromNeed(need: {
 }
 
 // ============================================
-// DATA EXPORT / IMPORT
+// DATA EXPORT / IMPORT (solo del espacio actual)
 // ============================================
 
 export function exportAllData(): string {
   const data = {
     missions: getMissions(),
-    settings: getSettings(),
     notifications: getNotifications(),
-    user: getCurrentUser(),
     exportedAt: new Date().toISOString(),
     version: '1.0',
   };
@@ -307,16 +278,25 @@ export function exportAllData(): string {
 export function importAllData(jsonString: string): boolean {
   try {
     const data = JSON.parse(jsonString);
-    if (data.missions) saveToStorage(STORAGE_KEYS.MISSIONS, data.missions);
-    if (data.settings) saveToStorage(STORAGE_KEYS.SETTINGS, data.settings);
-    if (data.notifications) saveToStorage(STORAGE_KEYS.NOTIFICATIONS, data.notifications);
-    if (data.user) saveToStorage(STORAGE_KEYS.USER, data.user);
+    if (data.missions) saveToStorage('missions', data.missions);
+    if (data.notifications) saveToStorage('notifications', data.notifications);
     return true;
   } catch {
     return false;
   }
 }
 
-export function clearAllData(): void {
-  Object.values(STORAGE_KEYS).forEach(key => localStorage.removeItem(key));
+export function clearSpaceData(): void {
+  const spaceId = getCurrentSpaceId();
+  if (!spaceId) return;
+  
+  // Eliminar solo datos de este espacio
+  const keysToRemove: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key && key.startsWith(`${STORAGE_PREFIX}${spaceId}_`)) {
+      keysToRemove.push(key);
+    }
+  }
+  keysToRemove.forEach(key => localStorage.removeItem(key));
 }
