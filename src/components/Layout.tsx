@@ -2,14 +2,22 @@ import { Outlet, Link, useLocation } from 'react-router-dom';
 import { LayoutDashboard, PlusCircle, Settings, Bell } from 'lucide-react';
 import { getNotifications } from '../store';
 
+import { signOut } from '../store';
+
 interface LayoutProps {
   userName: string;
+  onLogout?: () => void;
 }
 
-export default function Layout({ userName }: LayoutProps) {
+export default function Layout({ userName, onLogout }: LayoutProps) {
   const location = useLocation();
   const notifications = getNotifications();
   const unreadCount = notifications.filter(n => !n.read).length;
+
+  const handleLogout = () => {
+    signOut();
+    if (onLogout) onLogout();
+  };
 
   const isActive = (path: string) => {
     if (path === '/') return location.pathname === '/';
@@ -73,6 +81,13 @@ export default function Layout({ userName }: LayoutProps) {
                   <span className="text-indigo-700 font-medium text-sm">{userName.charAt(0).toUpperCase()}</span>
                 </div>
                 <span className="text-sm text-gray-700 hidden sm:block">{userName}</span>
+                <button
+                  onClick={handleLogout}
+                  className="text-xs text-gray-400 hover:text-gray-600 ml-1 hidden sm:block"
+                  title="Cerrar sesión"
+                >
+                  Salir
+                </button>
               </div>
             </div>
           </div>

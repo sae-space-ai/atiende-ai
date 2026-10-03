@@ -1,11 +1,12 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { Mission, MissionStatus, AppSettings, Notification, TaskStatus, ExecutionStatus } from './types';
+import type { Mission, MissionStatus, AppSettings, Notification, TaskStatus } from './types';
 
 const STORAGE_KEYS = {
   MISSIONS: 'atiende_missions',
   SETTINGS: 'atiende_settings',
   NOTIFICATIONS: 'atiende_notifications',
   USER: 'atiende_user',
+  SESSION: 'atiende_session',
 };
 
 // Default settings
@@ -16,25 +17,89 @@ const DEFAULT_SETTINGS: AppSettings = {
   externalSourcesConfigured: false,
   ocrConfigured: false,
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-  maxDocumentSize: 10 * 1024 * 1024, // 10MB
+  maxDocumentSize: 10 * 1024 * 1024,
   allowedExtensions: ['.pdf', '.docx', '.txt', '.csv', '.xlsx'],
 };
 
-// Generic storage helpers
+// Generic storage helpers with error handling
 function getFromStorage<T>(key: string, fallback: T): T {
   try {
     const data = localStorage.getItem(key);
-    return data ? JSON.parse(data) : fallback;
-  } catch {
+    if (!data) return fallback;
+    return JSON.parse(data) as T;
+  } catch (error) {
+    console.error(`Error reading ${key} from storage:`, error);
     return fallback;
   }
 }
 
-function saveToStorage<T>(key: string, data: T): void {
-  localStorage.setItem(key, JSON.stringify(data));
+function saveToStorage<T>(key: string, data: T): boolean {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+    return true;
+  } catch (error) {
+    console.error(`Error saving ${key} to storage:`, error);
+    if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+      addNotification({
+        type: 'error',
+        title: 'Almacenamiento lleno',
+        message: 'No se pudo guardar. Elimina misiones antiguas o documentos para liberar espacio.',
+      });
+    }
+    return false;
+  }
 }
 
-// Missions
+// ============================================
+// AUTH (local simulation - real auth needs Supabase)
+// ============================================
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  isAuthenticated: boolean;
+}
+
+export function getCurrentUser(): AuthUser {
+  const user = getFromStorage<AuthUser>(STORAGE_KEYS.USER, {
+    id: 'local-user',
+    name: 'Usuario',
+    email: '',
+    isAuthenticated: true,
+  });
+  return user;
+}
+
+export function signIn(name: string, email: string): AuthUser {
+  const user: AuthUser = {
+    id: uuidv4(),
+    name: name || 'Usuario',
+    email: email || '',
+    isAuthenticated: true,
+  };
+  saveToStorage(STORAGE_KEYS.USER, user);
+  saveToStorage(STORAGE_KEYS.SESSION, {
+    token: uuidv4(),
+    userId: user.id,
+    createdAt: new Date().toISOString(),
+  });
+  return user;
+}
+
+export function signOut(): void {
+  localStorage.removeItem(STORAGE_KEYS.SESSION);
+}
+
+export function isAuthenticated(): boolean {
+  const user = getCurrentUser();
+  return user.isAuthenticated;
+}
+
+// ============================================
+// MISSIONS
+// ============================================
+
 export function getMissions(): Mission[] {
   return getFromStorage<Mission[]>(STORAGE_KEYS.MISSIONS, []);
 }
@@ -43,7 +108,7 @@ export function getMission(id: string): Mission | undefined {
   return getMissions().find(m => m.id === id);
 }
 
-export function saveMission(mission: Mission): void {
+export function saveMission(mission: Mission): boolean {
   const missions = getMissions();
   const idx = missions.findIndex(m => m.id === mission.id);
   mission.updatedAt = new Date().toISOString();
@@ -52,12 +117,12 @@ export function saveMission(mission: Mission): void {
   } else {
     missions.push(mission);
   }
-  saveToStorage(STORAGE_KEYS.MISSIONS, missions);
+  return saveToStorage(STORAGE_KEYS.MISSIONS, missions);
 }
 
-export function deleteMission(id: string): void {
+export function deleteMission(id: string): boolean {
   const missions = getMissions().filter(m => m.id !== id);
-  saveToStorage(STORAGE_KEYS.MISSIONS, missions);
+  return saveToStorage(STORAGE_KEYS.MISSIONS, missions);
 }
 
 export function updateMissionStatus(id: string, status: MissionStatus): void {
@@ -65,6 +130,12 @@ export function updateMissionStatus(id: string, status: MissionStatus): void {
   if (mission) {
     mission.status = status;
     saveMission(mission);
+    addNotification({
+      missionId: id,
+      type: 'info',
+      title: `Misión ${status === 'completed' ? 'completada' : status === 'cancelled' ? 'cancelada' : 'actualizada'}`,
+      message: `La misión "${mission.need.title}" ha cambiado a estado: ${status}`,
+    });
   }
 }
 
@@ -81,16 +152,22 @@ export function updateTaskStatus(missionId: string, taskId: string, status: Task
   }
 }
 
-// Settings
+// ============================================
+// SETTINGS
+// ============================================
+
 export function getSettings(): AppSettings {
   return getFromStorage<AppSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
 }
 
-export function saveSettings(settings: AppSettings): void {
-  saveToStorage(STORAGE_KEYS.SETTINGS, settings);
+export function saveSettings(settings: AppSettings): boolean {
+  return saveToStorage(STORAGE_KEYS.SETTINGS, settings);
 }
 
-// Notifications
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
 export function getNotifications(): Notification[] {
   return getFromStorage<Notification[]>(STORAGE_KEYS.NOTIFICATIONS, []);
 }
@@ -115,21 +192,18 @@ export function markNotificationRead(id: string): void {
   }
 }
 
-// User (simple local user)
-export function getUser(): { id: string; name: string; email: string } {
-  return getFromStorage(STORAGE_KEYS.USER, { id: 'local-user', name: 'Usuario', email: '' });
+export function clearNotifications(): void {
+  saveToStorage(STORAGE_KEYS.NOTIFICATIONS, []);
 }
 
-export function saveUser(user: { id: string; name: string; email: string }): void {
-  saveToStorage(STORAGE_KEYS.USER, user);
-}
+// ============================================
+// UTILITIES
+// ============================================
 
-// ID generator
 export function generateId(): string {
   return uuidv4();
 }
 
-// Hash for documents
 export async function computeHash(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
@@ -137,7 +211,10 @@ export async function computeHash(file: File): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Mission creation helper
+// ============================================
+// MISSION CREATION
+// ============================================
+
 export function createMissionFromNeed(need: {
   title: string;
   description: string;
@@ -151,7 +228,6 @@ export function createMissionFromNeed(need: {
 }): Mission {
   const now = new Date().toISOString();
   const missionId = generateId();
-  const contractId = generateId();
   
   return {
     id: missionId,
@@ -170,7 +246,7 @@ export function createMissionFromNeed(need: {
       updatedAt: now,
     },
     contract: {
-      id: contractId,
+      id: generateId(),
       needId: missionId,
       version: 1,
       objective: need.expectedResult,
@@ -178,7 +254,7 @@ export function createMissionFromNeed(need: {
       exclusions: need.actionLimits,
       deliverables: [],
       acceptanceCriteria: need.closureCriteria
-        ? need.closureCriteria.split('\n').filter(Boolean).map((c, i) => ({
+        ? need.closureCriteria.split('\n').filter(Boolean).map((c) => ({
             id: generateId(),
             description: c.trim(),
             type: 'human_review' as const,
@@ -210,4 +286,37 @@ export function createMissionFromNeed(need: {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+// ============================================
+// DATA EXPORT / IMPORT
+// ============================================
+
+export function exportAllData(): string {
+  const data = {
+    missions: getMissions(),
+    settings: getSettings(),
+    notifications: getNotifications(),
+    user: getCurrentUser(),
+    exportedAt: new Date().toISOString(),
+    version: '1.0',
+  };
+  return JSON.stringify(data, null, 2);
+}
+
+export function importAllData(jsonString: string): boolean {
+  try {
+    const data = JSON.parse(jsonString);
+    if (data.missions) saveToStorage(STORAGE_KEYS.MISSIONS, data.missions);
+    if (data.settings) saveToStorage(STORAGE_KEYS.SETTINGS, data.settings);
+    if (data.notifications) saveToStorage(STORAGE_KEYS.NOTIFICATIONS, data.notifications);
+    if (data.user) saveToStorage(STORAGE_KEYS.USER, data.user);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function clearAllData(): void {
+  Object.values(STORAGE_KEYS).forEach(key => localStorage.removeItem(key));
 }

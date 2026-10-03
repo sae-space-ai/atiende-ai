@@ -12,6 +12,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     setMissions(getMissions());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const filteredMissions = filter === 'all' ? missions : missions.filter(m => m.status === filter);
