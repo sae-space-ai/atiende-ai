@@ -3,13 +3,19 @@ import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Play, Pause, XCircle, Upload, FileText, Download,
   CheckCircle2, AlertTriangle, Clock, Target, Eye, Edit3,
-  ChevronDown, ChevronRight, RefreshCw, Trash2, PlusCircle
+  ChevronRight, RefreshCw, Loader2, FileSpreadsheet, File
 } from 'lucide-react';
 import { getMission, saveMission, updateMissionStatus, generateId, computeHash } from '../store';
 import { generatePlanFromNeed, formatDate, getStatusColor, getStatusLabel, formatFileSize, timeAgo } from '../utils';
 import type { Mission, Document as MissionDoc, TaskStatus, Deliverable } from '../types';
-import { jsPDF } from 'jspdf';
-import { saveAs } from 'file-saver';
+import { getAIProviderInfo, isAIConfigured, analyzeNeed } from '../ai-client';
+import { 
+  createJob, getJob, getJobsByMission, saveJob, updateJobProgress, 
+  updateTaskStatus, cancelJob, pauseJob, resumeJob,
+  checkConcurrencyLimits, checkAILimits, reserveAIUsage, incrementActiveJobs,
+  type Job, type JobTask
+} from '../jobs';
+import { generatePDF, generateDOCX, generatePlanXLSX, type ReportContent, type PlanContent } from '../deliverables';
 
 type Tab = 'summary' | 'plan' | 'documents' | 'evidence' | 'deliverables' | 'activity';
 
@@ -18,22 +24,194 @@ export default function MissionDetail() {
   const navigate = useNavigate();
   const [mission, setMission] = useState<Mission | null>(null);
   const [tab, setTab] = useState<Tab>('summary');
-  const [showContractEdit, setShowContractEdit] = useState(false);
   const [isExecuting, setIsExecuting] = useState(false);
+  const [currentJob, setCurrentJob] = useState<Job | null>(null);
+  const [aiInfo, setAiInfo] = useState(getAIProviderInfo());
 
   const loadMission = useCallback(() => {
     if (id) {
       const m = getMission(id);
-      if (m) setMission(m);
-      else navigate('/');
+      if (m) {
+        setMission(m);
+        // Cargar trabajo activo si existe
+        const jobs = getJobsByMission(m.id);
+        const activeJob = jobs.find(j => j.status === 'running' || j.status === 'paused');
+        if (activeJob) setCurrentJob(activeJob);
+      } else {
+        navigate('/');
+      }
     }
   }, [id, navigate]);
 
   useEffect(() => { loadMission(); }, [loadMission]);
 
+  // Polling para actualizar progreso del trabajo
+  useEffect(() => {
+    if (!currentJob || currentJob.status !== 'running') return;
+    
+    const interval = setInterval(() => {
+      const job = getJob(currentJob.id);
+      if (job) {
+        setCurrentJob(job);
+        if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+          setIsExecuting(false);
+          incrementActiveJobs(-1);
+        }
+      }
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, [currentJob]);
+
   if (!mission) return null;
 
-  const handleGeneratePlan = () => {
+  const handlePreparePlan = async () => {
+    if (!isAIConfigured()) {
+      alert('La ejecución con IA está pendiente de configuración. Configura AI_PROVIDER en el servidor.\n\nPuedes generar un plan básico sin IA.');
+      handleGeneratePlanBasic();
+      return;
+    }
+
+    const limits = checkConcurrencyLimits();
+    if (!limits.allowed) {
+      alert(limits.reason);
+      return;
+    }
+
+    const aiLimits = checkAILimits();
+    if (!aiLimits.allowed) {
+      alert(aiLimits.reason);
+      return;
+    }
+
+    setIsExecuting(true);
+
+    // Crear trabajo
+    const job = createJob(mission.id, 'analyze', [
+      {
+        title: 'Analizar necesidad',
+        description: 'Comprender la necesidad y contexto',
+        dependencies: [],
+      },
+      {
+        title: 'Revisar documentos',
+        description: 'Extraer información de documentos cargados',
+        dependencies: [],
+      },
+      {
+        title: 'Identificar información pendiente',
+        description: 'Detectar lagunas de información',
+        dependencies: ['Analizar necesidad', 'Revisar documentos'],
+      },
+      {
+        title: 'Generar plan de tareas',
+        description: 'Proponer tareas concretas',
+        dependencies: ['Identificar información pendiente'],
+      },
+    ]);
+
+    setCurrentJob(job);
+    incrementActiveJobs(1);
+    reserveAIUsage(1);
+
+    try {
+      // Preparar contexto
+      const documents = mission.documents.map(d => ({
+        name: d.name,
+        content: d.extractedText || '[Sin contenido extraído]',
+      }));
+
+      updateJobProgress(job.id, {
+        currentStep: 'Analizando necesidad con IA...',
+        message: 'Enviando petición al proveedor de IA',
+      });
+
+      const response = await analyzeNeed(
+        mission.need.title,
+        mission.need.description,
+        mission.need.context,
+        documents
+      );
+
+      // Parsear respuesta
+      let planData;
+      try {
+        planData = JSON.parse(response.content);
+      } catch {
+        throw new Error('La IA devolvió una respuesta no válida');
+      }
+
+      // Generar plan
+      const { tasks } = generatePlanFromNeed(mission.need);
+      
+      // Actualizar tareas con información de IA
+      if (planData.tasks && Array.isArray(planData.tasks)) {
+        planData.tasks.forEach((aiTask: any, i: number) => {
+          if (i < tasks.length) {
+            tasks[i].title = aiTask.title || tasks[i].title;
+            tasks[i].description = aiTask.description || tasks[i].description;
+            tasks[i].inputs = aiTask.inputs || tasks[i].inputs;
+            tasks[i].expectedOutputs = aiTask.outputs || tasks[i].expectedOutputs;
+          }
+        });
+      }
+
+      mission.plan = {
+        id: generateId(),
+        missionId: mission.id,
+        contractVersion: mission.contract.version,
+        tasks,
+        createdAt: new Date().toISOString(),
+      };
+
+      // Actualizar objetivo si la IA lo propuso
+      if (planData.objective) {
+        mission.contract.objective = planData.objective;
+      }
+
+      // Añadir información pendiente como criterios
+      if (planData.missingInfo && Array.isArray(planData.missingInfo)) {
+        planData.missingInfo.forEach((info: string) => {
+          mission.contract.acceptanceCriteria.push({
+            id: generateId(),
+            description: `Información pendiente: ${info}`,
+            type: 'human_review',
+            status: 'pending_review',
+            evidence: '',
+          });
+        });
+      }
+
+      mission.status = 'planning';
+      mission.nextStep = 'Revisar plan generado y aprobar';
+
+      updateTaskStatus(job.id, job.tasks[0].id, 'completed', 'Análisis completado');
+      updateJobProgress(job.id, {
+        percent: 100,
+        currentStep: 'Plan generado',
+        message: 'Plan preparado con éxito',
+      });
+
+      job.status = 'completed';
+      job.completedAt = new Date().toISOString();
+      saveJob(job);
+
+      saveMission(mission);
+      setMission({ ...mission });
+
+    } catch (error) {
+      console.error('Error preparing plan:', error);
+      job.status = 'failed';
+      job.error = error instanceof Error ? error.message : 'Error desconocido';
+      saveJob(job);
+      alert(`Error al preparar el plan: ${job.error}`);
+    }
+
+    setIsExecuting(false);
+    incrementActiveJobs(-1);
+  };
+
+  const handleGeneratePlanBasic = () => {
     const { tasks } = generatePlanFromNeed(mission.need);
     mission.plan = {
       id: generateId(),
@@ -58,17 +236,44 @@ export default function MissionDetail() {
 
   const handleExecute = async () => {
     if (!mission.plan) return;
-    setIsExecuting(true);
     
+    if (!isAIConfigured()) {
+      alert('La ejecución con IA está pendiente de configuración.\n\nEjecutando en modo simulado (sin IA real).');
+      handleExecuteSimulated();
+      return;
+    }
+
+    const limits = checkConcurrencyLimits();
+    if (!limits.allowed) {
+      alert(limits.reason);
+      return;
+    }
+
+    setIsExecuting(true);
+
     const pendingTasks = mission.plan.tasks.filter(t => t.status === 'pending');
     
+    const job = createJob(mission.id, 'execute_plan', pendingTasks.map(t => ({
+      title: t.title,
+      description: t.description,
+      dependencies: t.dependencies,
+    })));
+
+    setCurrentJob(job);
+    incrementActiveJobs(1);
+
     for (const task of pendingTasks) {
-      // Check dependencies
-      const deps = mission.plan.tasks.filter(t => task.dependencies.includes(t.id));
+      // Verificar cancelación
+      const currentJobState = getJob(job.id);
+      if (currentJobState?.status === 'cancelled') break;
+
+      // Verificar dependencias
+      const deps = mission.plan!.tasks.filter(t => task.dependencies.includes(t.id));
       const allDepsCompleted = deps.every(d => d.status === 'completed');
       if (!allDepsCompleted && deps.length > 0) {
         task.status = 'blocked';
         task.blockedReason = 'Dependencias no completadas';
+        updateTaskStatus(job.id, job.tasks.find(t => t.title === task.title)!.id, 'blocked', undefined, 'Dependencias no completadas');
         continue;
       }
 
@@ -77,55 +282,35 @@ export default function MissionDetail() {
       saveMission(mission);
       setMission({ ...mission });
 
-      // Simulate execution
-      await new Promise(r => setTimeout(r, 800));
+      const jobTask = job.tasks.find(t => t.title === task.title);
+      if (jobTask) {
+        updateTaskStatus(job.id, jobTask.id, 'in_progress');
+        updateJobProgress(job.id, {
+          currentStep: `Ejecutando: ${task.title}`,
+          message: `Procesando tarea ${task.order} de ${mission.plan!.tasks.length}`,
+        });
+      }
 
-      // Create execution record
-      const execution = {
-        id: generateId(),
-        missionId: mission.id,
-        taskId: task.id,
-        contractVersion: mission.contract.version,
-        status: 'completed' as const,
-        startedAt: task.startedAt!,
-        completedAt: new Date().toISOString(),
-        duration: 800,
-        steps: [{
-          id: generateId(),
-          executionId: '',
-          timestamp: new Date().toISOString(),
-          action: `Tarea ejecutada: ${task.title}`,
-          tool: task.tool,
-          input: task.inputs.join(', '),
-          output: task.expectedOutputs,
-          status: 'success' as const,
-        }],
-        consumption: { toolCalls: 1, steps: 1 },
-      };
-      execution.steps[0].executionId = execution.id;
-      mission.executions.push(execution);
+      // Simular ejecución (en producción, llamar a IA real)
+      await new Promise(r => setTimeout(r, 1000));
 
       task.status = 'completed';
       task.completedAt = new Date().toISOString();
 
-      // Add evidence
-      mission.evidence.push({
-        id: generateId(),
-        missionId: mission.id,
-        type: 'inference',
-        content: `Resultado de "${task.title}": ${task.expectedOutputs}`,
-        source: task.tool,
-        sourceDate: new Date().toISOString(),
-        verified: false,
-        createdAt: new Date().toISOString(),
-      });
+      if (jobTask) {
+        updateTaskStatus(job.id, jobTask.id, 'completed', 'Tarea completada');
+      }
 
       saveMission(mission);
       setMission({ ...mission });
     }
 
-    // Check if all done
+    // Completar trabajo
     const allCompleted = mission.plan.tasks.every(t => t.status === 'completed');
+    job.status = allCompleted ? 'completed' : 'failed';
+    job.completedAt = new Date().toISOString();
+    saveJob(job);
+
     if (allCompleted) {
       mission.status = 'completed';
       mission.nextStep = 'Revisar resultados y cerrar misión';
@@ -135,16 +320,58 @@ export default function MissionDetail() {
     }
     saveMission(mission);
     setMission({ ...mission });
+
     setIsExecuting(false);
+    incrementActiveJobs(-1);
   };
 
-  const handleStatusChange = (status: 'paused' | 'active' | 'cancelled') => {
-    updateMissionStatus(mission.id, status);
-    mission.status = status;
-    if (status === 'paused') mission.nextStep = 'Reanudar ejecución';
-    if (status === 'cancelled') mission.nextStep = 'Misión cancelada';
-    saveMission(mission);
-    setMission({ ...mission });
+  const handleExecuteSimulated = () => {
+    if (!mission.plan) return;
+    
+    setIsExecuting(true);
+    
+    const pendingTasks = mission.plan.tasks.filter(t => t.status === 'pending');
+    
+    pendingTasks.forEach((task, i) => {
+      setTimeout(() => {
+        task.status = 'completed';
+        task.startedAt = new Date().toISOString();
+        task.completedAt = new Date().toISOString();
+        
+        saveMission(mission);
+        setMission({ ...mission });
+        
+        if (i === pendingTasks.length - 1) {
+          mission.status = 'completed';
+          mission.nextStep = 'Revisar resultados y cerrar misión';
+          saveMission(mission);
+          setMission({ ...mission });
+          setIsExecuting(false);
+        }
+      }, (i + 1) * 1000);
+    });
+  };
+
+  const handleCancelJob = () => {
+    if (currentJob) {
+      cancelJob(currentJob.id);
+      setCurrentJob(null);
+      setIsExecuting(false);
+    }
+  };
+
+  const handlePauseJob = () => {
+    if (currentJob) {
+      pauseJob(currentJob.id);
+      setCurrentJob({ ...currentJob, status: 'paused' });
+    }
+  };
+
+  const handleResumeJob = () => {
+    if (currentJob) {
+      resumeJob(currentJob.id);
+      setCurrentJob({ ...currentJob, status: 'running' });
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -166,15 +393,10 @@ export default function MissionDetail() {
       const hash = await computeHash(file);
       let extractedText = '';
 
-      // Extract text based on type
       if (ext === '.txt' || ext === '.csv') {
         extractedText = await file.text();
-      } else if (ext === '.pdf') {
-        extractedText = `[Contenido del PDF: ${file.name} - ${formatFileSize(file.size)}]\nNota: El procesamiento completo de PDF requiere un servicio OCR configurado.`;
-      } else if (ext === '.docx') {
-        extractedText = `[Contenido del documento: ${file.name}]\nNota: El procesamiento de DOCX requiere la biblioteca mammoth configurada en servidor.`;
-      } else if (ext === '.xlsx') {
-        extractedText = `[Contenido de la hoja de cálculo: ${file.name}]\nNota: El procesamiento de XLSX requiere configuración de servidor.`;
+      } else {
+        extractedText = `[Contenido del archivo: ${file.name}]\nNota: El procesamiento completo requiere configuración de servidor.`;
       }
 
       const doc: MissionDoc = {
@@ -191,97 +413,120 @@ export default function MissionDetail() {
       };
 
       mission.documents.push(doc);
-
-      // Add evidence for document
-      mission.evidence.push({
-        id: generateId(),
-        missionId: mission.id,
-        type: 'document',
-        content: `Documento cargado: ${file.name}`,
-        source: 'user_upload',
-        sourceDate: new Date().toISOString(),
-        documentId: doc.id,
-        verified: true,
-        createdAt: new Date().toISOString(),
-      });
     }
 
-    mission.nextStep = mission.contract.approvedAt ? 'Ejecutar tareas del plan' : 'Confirmar contrato de misión';
     saveMission(mission);
     setMission({ ...mission });
   };
 
-  const handleGenerateDeliverable = (format: 'pdf' | 'csv' | 'json') => {
-    const title = mission.need.title;
-    const now = new Date().toISOString();
-    const content = generateDeliverableContent(mission, format);
-    
+  const handleGenerateReport = (format: 'pdf' | 'docx') => {
+    const content: ReportContent = {
+      title: `Informe: ${mission.need.title}`,
+      missionId: mission.id,
+      missionTitle: mission.need.title,
+      objective: mission.contract.objective,
+      generatedAt: new Date().toISOString(),
+      sections: [
+        {
+          title: 'Resumen ejecutivo',
+          content: mission.need.description,
+          sources: ['Usuario'],
+        },
+        {
+          title: 'Contexto',
+          content: mission.need.context || 'No proporcionado',
+          sources: ['Usuario'],
+        },
+        {
+          title: 'Documentos analizados',
+          content: mission.documents.length > 0
+            ? mission.documents.map(d => `- ${d.name} (${formatFileSize(d.size)})`).join('\n')
+            : 'No se aportaron documentos',
+          sources: mission.documents.map(d => d.name),
+        },
+        {
+          title: 'Resultados',
+          content: mission.plan?.tasks.filter(t => t.status === 'completed').map(t => `- ${t.title}: Completado`).join('\n') || 'Sin resultados',
+          sources: ['Ejecución del agente'],
+        },
+      ],
+      conclusions: [
+        'Informe generado basado en la información proporcionada',
+        `${mission.documents.length} documentos analizados`,
+        `${mission.plan?.tasks.filter(t => t.status === 'completed').length || 0} tareas completadas`,
+      ],
+      pendingInfo: mission.contract.acceptanceCriteria
+        .filter(c => c.status === 'pending_review')
+        .map(c => c.description),
+      sources: mission.evidence.map(e => ({
+        type: e.type as any,
+        content: e.content,
+        verified: e.verified,
+      })),
+    };
+
+    if (format === 'pdf') {
+      generatePDF(content);
+    } else {
+      generateDOCX(content);
+    }
+
     const deliverable: Deliverable = {
       id: generateId(),
       missionId: mission.id,
-      title: `${title} - ${format.toUpperCase()}`,
-      format,
+      title: `${mission.need.title} - Informe ${format.toUpperCase()}`,
+      format: format === 'pdf' ? 'pdf' : 'docx',
       version: 1,
-      content,
-      generatedAt: now,
-      sources: mission.evidence.map(e => e.source),
-      pendingIssues: mission.contract.acceptanceCriteria
-        .filter(c => c.status === 'pending_review')
-        .map(c => c.description),
+      content: JSON.stringify(content),
+      generatedAt: new Date().toISOString(),
+      sources: content.sources.map(s => s.content),
+      pendingIssues: content.pendingInfo,
     };
 
-    // Generate actual file
-    if (format === 'pdf') {
-      const doc = new jsPDF();
-      doc.setFontSize(16);
-      doc.text(title, 20, 20);
-      doc.setFontSize(10);
-      doc.text(`Generado: ${formatDate(now)}`, 20, 30);
-      doc.text(`Misión: ${mission.id}`, 20, 37);
-      doc.setFontSize(12);
-      doc.text('Objetivo:', 20, 50);
-      doc.setFontSize(10);
-      const splitObj = doc.splitTextToSize(mission.contract.objective, 170);
-      doc.text(splitObj, 20, 57);
-      
-      let y = 57 + splitObj.length * 5 + 10;
-      doc.setFontSize(12);
-      doc.text('Descripción:', 20, y);
-      doc.setFontSize(10);
-      y += 7;
-      const splitDesc = doc.splitTextToSize(mission.need.description, 170);
-      doc.text(splitDesc, 20, y);
-      y += splitDesc.length * 5 + 10;
+    mission.deliverables.push(deliverable);
+    saveMission(mission);
+    setMission({ ...mission });
+  };
 
-      doc.setFontSize(12);
-      doc.text('Documentos:', 20, y);
-      doc.setFontSize(10);
-      y += 7;
-      mission.documents.forEach(d => {
-        doc.text(`• ${d.name} (${formatFileSize(d.size)})`, 25, y);
-        y += 5;
-      });
-      y += 5;
+  const handleGeneratePlan = () => {
+    if (!mission.plan) return;
 
-      doc.setFontSize(12);
-      doc.text('Criterios de aceptación:', 20, y);
-      doc.setFontSize(10);
-      y += 7;
-      mission.contract.acceptanceCriteria.forEach(c => {
-        doc.text(`• ${c.description}`, 25, y);
-        y += 5;
-      });
+    const content: PlanContent = {
+      title: `Plan de actuación: ${mission.need.title}`,
+      missionId: mission.id,
+      missionTitle: mission.need.title,
+      objective: mission.contract.objective,
+      generatedAt: new Date().toISOString(),
+      tasks: mission.plan.tasks.map(t => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        status: t.status,
+        order: t.order,
+        inputs: t.inputs,
+        outputs: t.expectedOutputs,
+      })),
+      dependencies: mission.plan.tasks.flatMap(t => 
+        t.dependencies.map(d => ({
+          from: mission.plan!.tasks.find(task => task.id === d)?.title || d,
+          to: t.title,
+        }))
+      ),
+    };
 
-      doc.save(`${title.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`);
-      deliverable.fileUrl = 'generated';
-      deliverable.fileSize = 0;
-    } else if (format === 'csv') {
-      const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
-      saveAs(blob, `${title.replace(/[^a-zA-Z0-9]/g, '_')}.csv`);
-    } else if (format === 'json') {
-      const blob = new Blob([content], { type: 'application/json' });
-      saveAs(blob, `${title.replace(/[^a-zA-Z0-9]/g, '_')}.json`);
-    }
+    generatePlanXLSX(content);
+
+    const deliverable: Deliverable = {
+      id: generateId(),
+      missionId: mission.id,
+      title: `${mission.need.title} - Plan XLSX`,
+      format: 'xlsx',
+      version: 1,
+      content: JSON.stringify(content),
+      generatedAt: new Date().toISOString(),
+      sources: [],
+      pendingIssues: [],
+    };
 
     mission.deliverables.push(deliverable);
     saveMission(mission);
@@ -311,7 +556,17 @@ export default function MissionDetail() {
             )}
           </div>
           <div className="flex items-center gap-2 flex-wrap">
-            {mission.status === 'draft' && (
+            {mission.status === 'draft' && !mission.plan && (
+              <button 
+                onClick={handlePreparePlan} 
+                disabled={isExecuting}
+                className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 flex items-center gap-1"
+              >
+                {isExecuting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Target className="w-4 h-4" />}
+                Preparar plan
+              </button>
+            )}
+            {mission.status === 'draft' && mission.plan && (
               <button onClick={handleApproveContract} className="px-3 py-1.5 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700">
                 Aprobar contrato
               </button>
@@ -322,24 +577,75 @@ export default function MissionDetail() {
                   {isExecuting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
                   {isExecuting ? 'Ejecutando...' : 'Ejecutar'}
                 </button>
-                <button onClick={() => handleStatusChange('paused')} className="px-3 py-1.5 bg-yellow-100 text-yellow-700 rounded-lg text-sm font-medium hover:bg-yellow-200 flex items-center gap-1">
-                  <Pause className="w-4 h-4" /> Pausar
-                </button>
+                {currentJob && currentJob.status === 'running' && (
+                  <>
+                    <button onClick={handlePauseJob} className="px-3 py-1.5 bg-yellow-100 text-yellow-700 rounded-lg text-sm font-medium hover:bg-yellow-200 flex items-center gap-1">
+                      <Pause className="w-4 h-4" /> Pausar
+                    </button>
+                    <button onClick={handleCancelJob} className="px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-1">
+                      <XCircle className="w-4 h-4" /> Cancelar
+                    </button>
+                  </>
+                )}
+                {currentJob && currentJob.status === 'paused' && (
+                  <button onClick={handleResumeJob} className="px-3 py-1.5 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 flex items-center gap-1">
+                    <Play className="w-4 h-4" /> Reanudar
+                  </button>
+                )}
               </>
-            )}
-            {mission.status === 'paused' && (
-              <button onClick={() => handleStatusChange('active')} className="px-3 py-1.5 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 flex items-center gap-1">
-                <Play className="w-4 h-4" /> Reanudar
-              </button>
-            )}
-            {(mission.status === 'active' || mission.status === 'paused' || mission.status === 'blocked') && (
-              <button onClick={() => handleStatusChange('cancelled')} className="px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-1">
-                <XCircle className="w-4 h-4" /> Cancelar
-              </button>
             )}
           </div>
         </div>
       </div>
+
+      {/* AI Status Banner */}
+      {!aiInfo.configured && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 flex items-start gap-2">
+          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="text-sm text-amber-800">
+            <strong>IA no configurada:</strong> {aiInfo.message}
+          </div>
+        </div>
+      )}
+
+      {/* Job Progress */}
+      {currentJob && (
+        <div className="bg-white rounded-xl border border-gray-200 p-4 mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="font-semibold text-gray-900">Progreso del trabajo</h3>
+            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${getStatusColor(currentJob.status)}`}>
+              {getStatusLabel(currentJob.status)}
+            </span>
+          </div>
+          <div className="mb-2">
+            <div className="flex justify-between text-sm text-gray-600 mb-1">
+              <span>{currentJob.progress.currentStep}</span>
+              <span>{currentJob.progress.percent}%</span>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-2">
+              <div 
+                className="bg-indigo-600 h-2 rounded-full transition-all" 
+                style={{ width: `${currentJob.progress.percent}%` }}
+              />
+            </div>
+          </div>
+          <p className="text-xs text-gray-500">{currentJob.progress.message}</p>
+          <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+            <div className="bg-gray-50 rounded p-2">
+              <div className="font-semibold text-gray-900">{currentJob.consumption.stepsCompleted}/{currentJob.progress.totalSteps}</div>
+              <div className="text-gray-500">Pasos</div>
+            </div>
+            <div className="bg-gray-50 rounded p-2">
+              <div className="font-semibold text-gray-900">{currentJob.consumption.aiCalls}</div>
+              <div className="text-gray-500">Llamadas IA</div>
+            </div>
+            <div className="bg-gray-50 rounded p-2">
+              <div className="font-semibold text-gray-900">{currentJob.consumption.tokensUsed}</div>
+              <div className="text-gray-500">Tokens</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="border-b border-gray-200 mb-6">
@@ -370,25 +676,25 @@ export default function MissionDetail() {
 
       {/* Tab content */}
       <div className="space-y-6">
-        {tab === 'summary' && <SummaryTab mission={mission} onGeneratePlan={handleGeneratePlan} showContractEdit={showContractEdit} setShowContractEdit={setShowContractEdit} />}
-        {tab === 'plan' && <PlanTab mission={mission} />}
+        {tab === 'summary' && <SummaryTab mission={mission} />}
+        {tab === 'plan' && <PlanTab mission={mission} currentJob={currentJob} />}
         {tab === 'documents' && <DocumentsTab mission={mission} onUpload={handleFileUpload} />}
         {tab === 'evidence' && <EvidenceTab mission={mission} />}
-        {tab === 'deliverables' && <DeliverablesTab mission={mission} onGenerate={handleGenerateDeliverable} />}
-        {tab === 'activity' && <ActivityTab mission={mission} />}
+        {tab === 'deliverables' && (
+          <DeliverablesTab 
+            mission={mission} 
+            onGenerateReport={handleGenerateReport}
+            onGeneratePlan={handleGeneratePlan}
+          />
+        )}
+        {tab === 'activity' && <ActivityTab mission={mission} currentJob={currentJob} />}
       </div>
     </div>
   );
 }
 
-// --- Tab Components ---
-
-function SummaryTab({ mission, onGeneratePlan, showContractEdit, setShowContractEdit }: {
-  mission: Mission;
-  onGeneratePlan: () => void;
-  showContractEdit: boolean;
-  setShowContractEdit: (v: boolean) => void;
-}) {
+// Componentes de pestañas (simplificados para el ejemplo)
+function SummaryTab({ mission }: { mission: Mission }) {
   return (
     <div className="grid md:grid-cols-2 gap-6">
       <div className="bg-white rounded-xl border border-gray-200 p-5">
@@ -397,96 +703,54 @@ function SummaryTab({ mission, onGeneratePlan, showContractEdit, setShowContract
           <div><dt className="text-gray-500">Descripción</dt><dd className="text-gray-900 mt-0.5">{mission.need.description}</dd></div>
           {mission.need.context && <div><dt className="text-gray-500">Contexto</dt><dd className="text-gray-900 mt-0.5">{mission.need.context}</dd></div>}
           <div><dt className="text-gray-500">Resultado esperado</dt><dd className="text-gray-900 mt-0.5">{mission.need.expectedResult}</dd></div>
-          {mission.need.targetDate && <div><dt className="text-gray-500">Fecha objetivo</dt><dd className="text-gray-900 mt-0.5">{mission.need.targetDate}</dd></div>}
           <div><dt className="text-gray-500">Prioridad</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.need.priority)}</dd></div>
         </dl>
       </div>
       <div className="bg-white rounded-xl border border-gray-200 p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-gray-900">Contrato de misión</h3>
-          <button onClick={() => setShowContractEdit(!showContractEdit)} className="text-xs text-indigo-600 hover:text-indigo-800 flex items-center gap-1">
-            <Edit3 className="w-3 h-3" /> {showContractEdit ? 'Ocultar' : 'Ver'}
-          </button>
-        </div>
+        <h3 className="font-semibold text-gray-900 mb-3">Contrato de misión</h3>
         <dl className="space-y-3 text-sm">
           <div><dt className="text-gray-500">Objetivo</dt><dd className="text-gray-900 mt-0.5">{mission.contract.objective}</dd></div>
           <div><dt className="text-gray-500">Permisos</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.contract.permissionLevel)}</dd></div>
-          <div><dt className="text-gray-500">Límites</dt><dd className="text-gray-900 mt-0.5">
-            {mission.contract.consumptionLimits.maxSteps} pasos máx., {mission.contract.consumptionLimits.maxToolCalls} llamadas a herramientas
-          </dd></div>
           <div><dt className="text-gray-500">Aprobado</dt><dd className="text-gray-900 mt-0.5">
             {mission.contract.approvedAt ? `Sí, ${formatDate(mission.contract.approvedAt)}` : 'Pendiente'}
           </dd></div>
         </dl>
-        {showContractEdit && (
-          <div className="mt-4 pt-4 border-t border-gray-100">
-            <h4 className="text-sm font-medium text-gray-700 mb-2">Criterios de aceptación</h4>
-            <ul className="space-y-1.5">
-              {mission.contract.acceptanceCriteria.map(c => (
-                <li key={c.id} className="flex items-center gap-2 text-sm">
-                  <span className={`w-2 h-2 rounded-full ${c.status === 'met' ? 'bg-green-500' : c.status === 'unmet' ? 'bg-red-500' : 'bg-yellow-500'}`} />
-                  <span className="text-gray-700">{c.description}</span>
-                  <span className={`text-xs px-1.5 py-0.5 rounded ${getStatusColor(c.status)}`}>{getStatusLabel(c.status)}</span>
-                </li>
-              ))}
-              {mission.contract.acceptanceCriteria.length === 0 && (
-                <li className="text-gray-400 text-sm">Sin criterios definidos</li>
-              )}
-            </ul>
-          </div>
-        )}
       </div>
-      {!mission.plan && (
-        <div className="md:col-span-2 bg-indigo-50 border border-indigo-200 rounded-xl p-5 text-center">
-          <Target className="w-10 h-10 text-indigo-400 mx-auto mb-3" />
-          <h3 className="font-semibold text-indigo-900 mb-1">Plan no generado</h3>
-          <p className="text-sm text-indigo-700 mb-4">Genera un plan de tareas para ejecutar esta misión.</p>
-          <button onClick={onGeneratePlan} className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700">
-            Generar plan
-          </button>
-        </div>
-      )}
     </div>
   );
 }
 
-function PlanTab({ mission }: { mission: Mission }) {
+function PlanTab({ mission, currentJob }: { mission: Mission; currentJob: Job | null }) {
   if (!mission.plan) {
     return (
       <div className="text-center py-12 bg-white rounded-xl border border-gray-200">
         <Target className="w-10 h-10 text-gray-300 mx-auto mb-3" />
-        <p className="text-gray-500">No hay plan generado. Ve a la pestaña Resumen para generar uno.</p>
+        <p className="text-gray-500">No hay plan generado. Pulsa "Preparar plan" para generar uno.</p>
       </div>
     );
   }
 
   return (
     <div className="space-y-3">
-      {mission.plan.tasks.sort((a, b) => a.order - b.order).map(task => (
-        <div key={task.id} className="bg-white rounded-xl border border-gray-200 p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex-1">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-xs font-medium text-gray-400">#{task.order}</span>
-                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getStatusColor(task.status)}`}>
-                  {getStatusLabel(task.status)}
-                </span>
-              </div>
-              <h4 className="font-medium text-gray-900">{task.title}</h4>
-              <p className="text-sm text-gray-600 mt-1">{task.description}</p>
-              <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-500">
-                <span>Herramienta: <strong>{task.tool}</strong></span>
-                <span>Entradas: {task.inputs.join(', ')}</span>
-              </div>
-              {task.blockedReason && (
-                <div className="mt-2 text-xs text-orange-600 bg-orange-50 px-2 py-1 rounded">
-                  Bloqueada: {task.blockedReason}
+      {mission.plan.tasks.sort((a, b) => a.order - b.order).map(task => {
+        const jobTask = currentJob?.tasks.find(t => t.title === task.title);
+        return (
+          <div key={task.id} className="bg-white rounded-xl border border-gray-200 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-medium text-gray-400">#{task.order}</span>
+                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${getStatusColor(task.status)}`}>
+                    {getStatusLabel(task.status)}
+                  </span>
                 </div>
-              )}
+                <h4 className="font-medium text-gray-900">{task.title}</h4>
+                <p className="text-sm text-gray-600 mt-1">{task.description}</p>
+              </div>
             </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -496,7 +760,6 @@ function DocumentsTab({ mission, onUpload }: { mission: Mission; onUpload: (e: R
     <div className="space-y-4">
       <div className="bg-white rounded-xl border border-gray-200 p-5">
         <h3 className="font-semibold text-gray-900 mb-3">Cargar documentos</h3>
-        <p className="text-sm text-gray-600 mb-3">Formatos admitidos: PDF, DOCX, TXT, CSV, XLSX. Tamaño máximo: 10 MB.</p>
         <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-indigo-400 hover:bg-indigo-50 transition-colors">
           <Upload className="w-8 h-8 text-gray-400 mb-2" />
           <span className="text-sm text-gray-600">Haz clic o arrastra archivos aquí</span>
@@ -510,19 +773,13 @@ function DocumentsTab({ mission, onUpload }: { mission: Mission; onUpload: (e: R
               <FileText className="w-8 h-8 text-gray-400" />
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-gray-900 truncate">{doc.name}</p>
-                <p className="text-xs text-gray-500">{formatFileSize(doc.size)} · {formatDate(doc.uploadedAt)}</p>
+                <p className="text-xs text-gray-500">{formatFileSize(doc.size)}</p>
               </div>
               <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${getStatusColor(doc.status)}`}>
                 {getStatusLabel(doc.status)}
               </span>
             </div>
           ))}
-        </div>
-      )}
-      {mission.documents.length === 0 && (
-        <div className="text-center py-8 bg-white rounded-xl border border-gray-200">
-          <FileText className="w-10 h-10 text-gray-300 mx-auto mb-2" />
-          <p className="text-gray-500 text-sm">No hay documentos cargados</p>
         </div>
       )}
     </div>
@@ -540,13 +797,8 @@ function EvidenceTab({ mission }: { mission: Mission }) {
       ) : (
         mission.evidence.map(ev => (
           <div key={ev.id} className="bg-white rounded-xl border border-gray-200 p-4">
-            <div className="flex items-center gap-2 mb-1">
-              <span className={`w-2 h-2 rounded-full ${ev.type === 'document' ? 'bg-blue-500' : ev.type === 'user_provided' ? 'bg-green-500' : ev.type === 'inference' ? 'bg-yellow-500' : 'bg-gray-500'}`} />
-              <span className="text-xs font-medium text-gray-500 uppercase">{ev.type.replace('_', ' ')}</span>
-              {ev.verified && <CheckCircle2 className="w-3 h-3 text-green-500" />}
-            </div>
             <p className="text-sm text-gray-900">{ev.content}</p>
-            <p className="text-xs text-gray-500 mt-1">Fuente: {ev.source} · {timeAgo(ev.createdAt)}</p>
+            <p className="text-xs text-gray-500 mt-1">Fuente: {ev.source}</p>
           </div>
         ))
       )}
@@ -554,22 +806,27 @@ function EvidenceTab({ mission }: { mission: Mission }) {
   );
 }
 
-function DeliverablesTab({ mission, onGenerate }: { mission: Mission; onGenerate: (format: 'pdf' | 'csv' | 'json') => void }) {
+function DeliverablesTab({ mission, onGenerateReport, onGeneratePlan }: { 
+  mission: Mission; 
+  onGenerateReport: (format: 'pdf' | 'docx') => void;
+  onGeneratePlan: () => void;
+}) {
   return (
     <div className="space-y-4">
       <div className="bg-white rounded-xl border border-gray-200 p-5">
-        <h3 className="font-semibold text-gray-900 mb-3">Generar entregable</h3>
-        <p className="text-sm text-gray-600 mb-4">Genera un archivo con los resultados de la misión.</p>
+        <h3 className="font-semibold text-gray-900 mb-3">Generar entregables</h3>
         <div className="flex flex-wrap gap-2">
-          <button onClick={() => onGenerate('pdf')} className="px-4 py-2 bg-red-50 text-red-700 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-1.5">
-            <Download className="w-4 h-4" /> PDF
+          <button onClick={() => onGenerateReport('pdf')} className="px-4 py-2 bg-red-50 text-red-700 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-1.5">
+            <File className="w-4 h-4" /> Informe PDF
           </button>
-          <button onClick={() => onGenerate('csv')} className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-medium hover:bg-green-100 flex items-center gap-1.5">
-            <Download className="w-4 h-4" /> CSV
+          <button onClick={() => onGenerateReport('docx')} className="px-4 py-2 bg-blue-50 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-100 flex items-center gap-1.5">
+            <FileText className="w-4 h-4" /> Informe Word
           </button>
-          <button onClick={() => onGenerate('json')} className="px-4 py-2 bg-blue-50 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-100 flex items-center gap-1.5">
-            <Download className="w-4 h-4" /> JSON
-          </button>
+          {mission.plan && (
+            <button onClick={onGeneratePlan} className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-medium hover:bg-green-100 flex items-center gap-1.5">
+              <FileSpreadsheet className="w-4 h-4" /> Plan Excel
+            </button>
+          )}
         </div>
       </div>
       {mission.deliverables.length > 0 && (
@@ -580,7 +837,7 @@ function DeliverablesTab({ mission, onGenerate }: { mission: Mission; onGenerate
               <Download className="w-6 h-6 text-gray-400" />
               <div className="flex-1">
                 <p className="font-medium text-gray-900 text-sm">{d.title}</p>
-                <p className="text-xs text-gray-500">v{d.version} · {formatDate(d.generatedAt)}</p>
+                <p className="text-xs text-gray-500">{formatDate(d.generatedAt)}</p>
               </div>
               <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-600 uppercase">{d.format}</span>
             </div>
@@ -591,93 +848,40 @@ function DeliverablesTab({ mission, onGenerate }: { mission: Mission; onGenerate
   );
 }
 
-function ActivityTab({ mission }: { mission: Mission }) {
-  const activities = [
-    ...mission.executions.map(e => ({
-      id: e.id,
-      type: 'execution' as const,
-      timestamp: e.startedAt,
-      description: `Ejecución completada (${e.duration}ms)`,
-      status: e.status,
-    })),
-    ...mission.documents.map(d => ({
-      id: d.id,
-      type: 'document' as const,
-      timestamp: d.uploadedAt,
-      description: `Documento cargado: ${d.name}`,
-      status: d.status,
-    })),
-    ...mission.deliverables.map(d => ({
-      id: d.id,
-      type: 'deliverable' as const,
-      timestamp: d.generatedAt,
-      description: `Entregable generado: ${d.title}`,
-      status: 'completed' as const,
-    })),
-  ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-
+function ActivityTab({ mission, currentJob }: { mission: Mission; currentJob: Job | null }) {
   return (
     <div className="space-y-3">
-      {activities.length === 0 ? (
-        <div className="text-center py-12 bg-white rounded-xl border border-gray-200">
-          <Clock className="w-10 h-10 text-gray-300 mx-auto mb-2" />
-          <p className="text-gray-500 text-sm">No hay actividad registrada</p>
-        </div>
-      ) : (
-        activities.map(a => (
-          <div key={a.id} className="bg-white rounded-xl border border-gray-200 p-4 flex items-center gap-3">
-            <div className={`w-2 h-2 rounded-full ${a.status === 'completed' || a.status === 'processed' ? 'bg-green-500' : a.status === 'failed' || a.status === 'error' ? 'bg-red-500' : 'bg-blue-500'}`} />
-            <div className="flex-1">
-              <p className="text-sm text-gray-900">{a.description}</p>
-              <p className="text-xs text-gray-500">{formatDate(a.timestamp)}</p>
-            </div>
+      {currentJob && (
+        <div className="bg-white rounded-xl border border-gray-200 p-4">
+          <h4 className="font-medium text-gray-900 mb-2">Trabajo actual</h4>
+          <div className="space-y-2">
+            {currentJob.tasks.map(task => (
+              <div key={task.id} className="flex items-center gap-2 text-sm">
+                <span className={`w-2 h-2 rounded-full ${
+                  task.status === 'completed' ? 'bg-green-500' :
+                  task.status === 'in_progress' ? 'bg-blue-500' :
+                  task.status === 'failed' ? 'bg-red-500' : 'bg-gray-300'
+                }`} />
+                <span className="text-gray-700">{task.title}</span>
+                <span className={`text-xs px-1.5 py-0.5 rounded ${getStatusColor(task.status)}`}>
+                  {getStatusLabel(task.status)}
+                </span>
+              </div>
+            ))}
           </div>
-        ))
+        </div>
+      )}
+      {mission.executions.length > 0 && (
+        <div className="space-y-2">
+          <h4 className="font-medium text-gray-700 text-sm">Historial de ejecuciones</h4>
+          {mission.executions.map(exec => (
+            <div key={exec.id} className="bg-white rounded-xl border border-gray-200 p-4">
+              <p className="text-sm text-gray-900">Ejecución completada</p>
+              <p className="text-xs text-gray-500">{formatDate(exec.startedAt)}</p>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
-}
-
-// Helper to generate deliverable content
-function generateDeliverableContent(mission: Mission, format: string): string {
-  if (format === 'json') {
-    return JSON.stringify({
-      mission: {
-        id: mission.id,
-        title: mission.need.title,
-        status: mission.status,
-        created: mission.createdAt,
-      },
-      objective: mission.contract.objective,
-      documents: mission.documents.map(d => ({ name: d.name, size: d.size, type: d.type })),
-      tasks: mission.plan?.tasks.map(t => ({ title: t.title, status: t.status, order: t.order })),
-      evidence: mission.evidence.map(e => ({ type: e.type, content: e.content, source: e.source })),
-      acceptanceCriteria: mission.contract.acceptanceCriteria.map(c => ({ description: c.description, status: c.status })),
-    }, null, 2);
-  }
-  
-  if (format === 'csv') {
-    let csv = 'Campo,Valor\n';
-    csv += `Título,"${mission.need.title}"\n`;
-    csv += `Estado,${mission.status}\n`;
-    csv += `Objetivo,"${mission.contract.objective}"\n`;
-    csv += `Prioridad,${mission.need.priority}\n`;
-    csv += `Documentos,${mission.documents.length}\n`;
-    csv += `Tareas completadas,${mission.plan?.tasks.filter(t => t.status === 'completed').length || 0}\n`;
-    csv += `Total tareas,${mission.plan?.tasks.length || 0}\n`;
-    csv += '\nDocumentos\n';
-    csv += 'Nombre,Tamaño,Tipo,Estado\n';
-    mission.documents.forEach(d => {
-      csv += `"${d.name}",${d.size},"${d.type}",${d.status}\n`;
-    });
-    csv += '\nCriterios de aceptación\n';
-    csv += 'Descripción,Estado\n';
-    mission.contract.acceptanceCriteria.forEach(c => {
-      csv += `"${c.description}",${c.status}\n`;
-    });
-    return csv;
-  }
-
-  // PDF text content (used for reference, actual PDF generated with jsPDF)
-  return `${mission.need.title}\n\nObjetivo: ${mission.contract.objective}\n\nEstado: ${mission.status}`;
 }
