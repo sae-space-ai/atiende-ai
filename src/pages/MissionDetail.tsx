@@ -16,6 +16,7 @@ import {
   type Job, type JobTask
 } from '../jobs';
 import { generatePDF, generateDOCX, generatePlanXLSX, type ReportContent, type PlanContent } from '../deliverables';
+import MigratePlanButton from '../components/MigratePlanButton';
 
 type Tab = 'summary' | 'plan' | 'documents' | 'evidence' | 'deliverables' | 'activity';
 
@@ -676,7 +677,7 @@ export default function MissionDetail() {
 
       {/* Tab content */}
       <div className="space-y-6">
-        {tab === 'summary' && <SummaryTab mission={mission} />}
+        {tab === 'summary' && <SummaryTab mission={mission} onMigrated={loadMission} />}
         {tab === 'plan' && <PlanTab mission={mission} currentJob={currentJob} />}
         {tab === 'documents' && <DocumentsTab mission={mission} onUpload={handleFileUpload} />}
         {tab === 'evidence' && <EvidenceTab mission={mission} />}
@@ -694,27 +695,36 @@ export default function MissionDetail() {
 }
 
 // Componentes de pestañas (simplificados para el ejemplo)
-function SummaryTab({ mission }: { mission: Mission }) {
+function SummaryTab({ mission, onMigrated }: { mission: Mission; onMigrated: () => void }) {
   return (
-    <div className="grid md:grid-cols-2 gap-6">
-      <div className="bg-white rounded-xl border border-gray-200 p-5">
-        <h3 className="font-semibold text-gray-900 mb-3">Necesidad</h3>
-        <dl className="space-y-3 text-sm">
-          <div><dt className="text-gray-500">Descripción</dt><dd className="text-gray-900 mt-0.5">{mission.need.description}</dd></div>
-          {mission.need.context && <div><dt className="text-gray-500">Contexto</dt><dd className="text-gray-900 mt-0.5">{mission.need.context}</dd></div>}
-          <div><dt className="text-gray-500">Resultado esperado</dt><dd className="text-gray-900 mt-0.5">{mission.need.expectedResult}</dd></div>
-          <div><dt className="text-gray-500">Prioridad</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.need.priority)}</dd></div>
-        </dl>
+    <div className="space-y-6">
+      <div className="grid md:grid-cols-2 gap-6">
+        <div className="bg-white rounded-xl border border-gray-200 p-5">
+          <h3 className="font-semibold text-gray-900 mb-3">Necesidad</h3>
+          <dl className="space-y-3 text-sm">
+            <div><dt className="text-gray-500">Descripción</dt><dd className="text-gray-900 mt-0.5">{mission.need.description}</dd></div>
+            {mission.need.context && <div><dt className="text-gray-500">Contexto</dt><dd className="text-gray-900 mt-0.5">{mission.need.context}</dd></div>}
+            <div><dt className="text-gray-500">Resultado esperado</dt><dd className="text-gray-900 mt-0.5">{mission.need.expectedResult}</dd></div>
+            <div><dt className="text-gray-500">Prioridad</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.need.priority)}</dd></div>
+          </dl>
+        </div>
+        <div className="bg-white rounded-xl border border-gray-200 p-5">
+          <h3 className="font-semibold text-gray-900 mb-3">Contrato de misión</h3>
+          <dl className="space-y-3 text-sm">
+            <div><dt className="text-gray-500">Objetivo</dt><dd className="text-gray-900 mt-0.5">{mission.contract.objective}</dd></div>
+            <div><dt className="text-gray-500">Permisos</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.contract.permissionLevel)}</dd></div>
+            <div><dt className="text-gray-500">Versión</dt><dd className="text-gray-900 mt-0.5">v{mission.contract.version}</dd></div>
+            <div><dt className="text-gray-500">Aprobado</dt><dd className="text-gray-900 mt-0.5">
+              {mission.contract.approvedAt ? `Sí, ${formatDate(mission.contract.approvedAt)}` : 'Pendiente'}
+            </dd></div>
+          </dl>
+        </div>
       </div>
+      
+      {/* Botón de migración */}
       <div className="bg-white rounded-xl border border-gray-200 p-5">
-        <h3 className="font-semibold text-gray-900 mb-3">Contrato de misión</h3>
-        <dl className="space-y-3 text-sm">
-          <div><dt className="text-gray-500">Objetivo</dt><dd className="text-gray-900 mt-0.5">{mission.contract.objective}</dd></div>
-          <div><dt className="text-gray-500">Permisos</dt><dd className="text-gray-900 mt-0.5">{getStatusLabel(mission.contract.permissionLevel)}</dd></div>
-          <div><dt className="text-gray-500">Aprobado</dt><dd className="text-gray-900 mt-0.5">
-            {mission.contract.approvedAt ? `Sí, ${formatDate(mission.contract.approvedAt)}` : 'Pendiente'}
-          </dd></div>
-        </dl>
+        <h3 className="font-semibold text-gray-900 mb-3">Gestión del plan</h3>
+        <MigratePlanButton mission={mission} onMigrated={onMigrated} />
       </div>
     </div>
   );
